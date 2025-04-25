@@ -1,43 +1,89 @@
-# Simple workflow for deploying static content to GitHub Pages
-name: Deploy static content to Pages
+name: Run SQL Server
+description: Runs SQL Server using a method appropriate for the target platform
+inputs:
+  connection-string-env-var:
+    description: Name of the output environment variable that will receive the connection string
+    required: true
+  catalog:
+    description: Name of the initial database name (catalog) to create
+    required: false
+    default: nservicebus
+  sqlserver-version:
+    description: The SQL server major version to use
+    required: false
+    default: "2022"
+  extra-params:
+    description: Extra parameters to add to the connection string
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Install SQL Server (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh 
+      run: |
+        # Windows SQL install via Chocolatey
+        $template = @'
+        {[string]Package*:sql-server-express}|{[int]Major:2022}.{[int]Minor:16}.{[int]Patch:0}.{[int]Build:1000}
+        {[string]Package*:sql-server-express}|{[int]Major:2022}.{[int]Minor:16}.{[int]Patch:0}.{[int]Build:0}
+        {[string]Package*:sql-server-express}|{[int]Major:14}.{[int]Minor:1801}.{[int]Patch:3958}.{[int]Build:1}
+        '@
 
-on:
-  # Runs on pushes targeting the default branch
-  push:
-    branches: ["main"]
+        # Limited output should be sql-server-express|versionstring
+        $availableVersions = choco search sql-server-express --exact --all-versions --limit-output | Where-Object { $_ -like "*${{ inputs.sqlserver-version }}**" }
+        # IncludeExtent will feed the input into an ExtendText property. Using the template examples helps to order by Major which is all we are interested in
+        $sortedVersions = $availableVersions | ConvertFrom-String -TemplateContent $template -IncludeExtent | Sort-Object -Property Major -Descending
+        $newestVersion = $sortedVersions[0].ExtentText.Split("|")[1]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+        if ($newestVersion) {
+            Write-Output "Installing SQL Server Express version $newestVersion with Chocolatey..."
+            choco install sql-server-express --version $newestVersion -y --no-progress
+        } else {
+            Write-Output "No versions found matching the prefix '${{ inputs.sqlserver-version }}'. Installing latest with Chocolatey..."
+            choco install sql-server-express --no-progress
+        }
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+        Write-Output "Setting environment variables for sqlcmd..."
+        Write-Output "SQLCMDSERVER=.\SQLEXPRESS" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf-8 -Append
 
-# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
-# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
+        Write-Output "Setting environment variable ${{ inputs.connection-string-env-var }} to SQL connection string..."
+        Write-Output "${{ inputs.connection-string-env-var }}=Data Source=.\SQLEXPRESS;Initial Catalog=${{ inputs.catalog }};Integrated Security=True;Encrypt=false;${{ inputs.extra-params }}" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf-8 -Append
+    - name: Start SQL Server (Linux)
+      if: runner.os == 'Linux'              
+      shell: bash         
+      run: |
+        # Linux SQL install via Docker
+        
+        # If the password generator needs to be changed, make sure the resulting password meets SQL Server password requirements
+        sa_pw=$(uuidgen) 
+        echo "::add-mask::$sa_pw"
 
-jobs:
-  # Single deploy job since we're just deploying
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          # Upload entire repository
-          path: '.'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        echo "Starting SQL Server in a Docker container..."
+        docker run -e "ACCEPT_EULA=Y" -e "SA_PASSWORD=$sa_pw" -e "MSSQL_PID=Developer" -e "MSSQL_COLLATION=SQL_Latin1_General_CP1_CS_AS" -p 1433:1433 --name sqlserver -d mcr.microsoft.com/mssql/server:${{ inputs.sqlserver-version }}-latest
+        
+        echo "Setting environment variables for sqlcmd..."
+        echo "SQLCMDPASSWORD=$sa_pw" >> $GITHUB_ENV
+        echo "SQLCMDUSER=sa" >> $GITHUB_ENV
+        echo "SQLCMDSERVER=localhost,1433" >> $GITHUB_ENV
+
+        echo "Setting environment variable ${{ inputs.connection-string-env-var }} to SQL connection string..."
+        echo "${{ inputs.connection-string-env-var }}=Server=localhost;Database=${{ inputs.catalog }};User Id=sa;Password=$sa_pw;Encrypt=false;${{ inputs.extra-params }}" >> $GITHUB_ENV  
+    - name: Setup server
+      shell: pwsh
+      run: |
+        # Wait for availability then create initial catalog
+
+        for ($i = 1; $i -le 30; $i++) {
+          Write-Output "Attempt $i/30 to connect to SQL Server..."
+          sqlcmd -b -Q "SELECT @@SERVERNAME as ServerName" 2>&1>$null
+          if ($?) {
+            Write-Output "  - SQL Server is now ready"
+            break
+          } else {
+            Write-Output "  - Not ready, sleeping for 5s"
+            Start-Sleep -seconds 5
+          }
+        }
+
+        Write-Output "Creating initial catalog '${{ inputs.catalog }}'"
+        sqlcmd -Q "CREATE DATABASE [${{ inputs.catalog }}]"
